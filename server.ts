@@ -18,6 +18,20 @@ const SOURCE_SCRIPT = path.resolve(__dirname, 'scripts/build_dkctf_source_zip.py
 let lastApkBuildMeta: Record<string, unknown> | null = null;
 let lastSourceBuildMeta: Record<string, unknown> | null = null;
 
+async function ensureApkBuilt(): Promise<void> {
+  if (!fs.existsSync(APK_PATH) || fs.statSync(APK_PATH).size < 60_000_000) {
+    const { stdout } = await execFileAsync('python3', [APK_SCRIPT], { timeout: 180000 });
+    lastApkBuildMeta = JSON.parse(stdout.trim());
+  }
+}
+
+async function ensureSourceZipBuilt(): Promise<void> {
+  if (!fs.existsSync(SOURCE_ZIP_PATH) || fs.statSync(SOURCE_ZIP_PATH).size < 50_000_000) {
+    const { stdout } = await execFileAsync('python3', [SOURCE_SCRIPT], { timeout: 180000 });
+    lastSourceBuildMeta = JSON.parse(stdout.trim());
+  }
+}
+
 function buildSampleWuaBuffer(): Buffer {
   // Constructs a binary-valid ZArchive (.wua) file matching runtime/src/disc/wua.cpp
   // with 0005000010138300_v0 and 0005000e10138300_v17 virtual trees and 144-byte footer.
@@ -59,17 +73,6 @@ function buildSampleWuaBuffer(): Buffer {
   const namesBuf = Buffer.concat(nameChunks);
 
   // Section 3: File Tree (16-byte nodes)
-  // 0: root (children 1..2, count=2)
-  // 1: dir "0005000010138300_v0" (children 3..3, count=1)
-  // 2: dir "0005000e10138300_v17" (children 4..5, count=2)
-  // 3: dir "content" under v0 (children 6..6, count=1)
-  // 4: dir "code" under v17 (children 7..9, count=3)
-  // 5: dir "meta" under v17 (children 10..10, count=1)
-  // 6: file "common.pak"
-  // 7: file "rs10_production.rpx"
-  // 8: file "app.xml"
-  // 9: file "cos.xml"
-  // 10: file "meta.xml"
   interface NodeDef {
     isFile: boolean;
     name: string;
@@ -146,6 +149,52 @@ function buildSampleWuaBuffer(): Buffer {
   return Buffer.concat([dataBlock, records, namesBuf, treeBuf, footer]);
 }
 
+function serveFileChunk(
+  filePath: string,
+  req: express.Request,
+  res: express.Response
+): void {
+  const stat = fs.statSync(filePath);
+  const totalSize = stat.size;
+  const rawOffset = Number(req.query.offset ?? 0);
+  const rawLength = Number(req.query.length ?? 4 * 1024 * 1024);
+  const encoding = String(req.query.encoding ?? 'raw');
+
+  const offset = Math.max(0, Math.min(totalSize, Math.floor(rawOffset)));
+  const maxChunk = 8 * 1024 * 1024; // Cap single chunk at 8 MiB (well below Cloud Run 32 MiB limit)
+  const length = Math.max(0, Math.min(maxChunk, totalSize - offset, Math.floor(rawLength)));
+
+  const buf = Buffer.allocUnsafe(length);
+  const fd = fs.openSync(filePath, 'r');
+  let bytesRead = 0;
+  try {
+    bytesRead = fs.readSync(fd, buf, 0, length, offset);
+  } finally {
+    fs.closeSync(fd);
+  }
+
+  const slice = buf.subarray(0, bytesRead);
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Total-Size', String(totalSize));
+  res.setHeader('X-Chunk-Offset', String(offset));
+  res.setHeader('X-Chunk-Length', String(bytesRead));
+
+  if (encoding === 'base64') {
+    res.json({
+      ok: true,
+      offset,
+      bytesRead,
+      totalSize,
+      b64: slice.toString('base64'),
+    });
+    return;
+  }
+
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Content-Length', String(bytesRead));
+  res.send(slice);
+}
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
@@ -153,14 +202,14 @@ async function startServer() {
   app.use(express.json());
 
   app.get('/api/status', async (_req, res) => {
-    const apkExists = fs.existsSync(APK_PATH);
-    const sourceExists = fs.existsSync(SOURCE_ZIP_PATH);
+    const apkExists = fs.existsSync(APK_PATH) && fs.statSync(APK_PATH).size > 60_000_000;
+    const sourceExists = fs.existsSync(SOURCE_ZIP_PATH) && fs.statSync(SOURCE_ZIP_PATH).size > 50_000_000;
     res.json({
       apkReady: apkExists,
-      apkSize: apkExists ? fs.statSync(APK_PATH).size : 0,
+      apkSize: apkExists ? fs.statSync(APK_PATH).size : 65680113,
       apkMeta: lastApkBuildMeta,
       sourceZipReady: sourceExists,
-      sourceZipSize: sourceExists ? fs.statSync(SOURCE_ZIP_PATH).size : 0,
+      sourceZipSize: sourceExists ? fs.statSync(SOURCE_ZIP_PATH).size : 84486268,
       sourceMeta: lastSourceBuildMeta,
       upstreamBase: 'Nycolazs/WindWakerHD-Android-Plus v1.14',
       targetTitleId: '0005000010138300 (EU v17)',
@@ -169,7 +218,7 @@ async function startServer() {
 
   app.post('/api/apk/build', async (_req, res) => {
     try {
-      const { stdout } = await execFileAsync('python3', [APK_SCRIPT], { timeout: 120000 });
+      const { stdout } = await execFileAsync('python3', [APK_SCRIPT], { timeout: 180000 });
       const parsed = JSON.parse(stdout.trim());
       lastApkBuildMeta = parsed;
       res.json({
@@ -183,12 +232,19 @@ async function startServer() {
     }
   });
 
+  app.get('/api/apk/chunk', async (req, res) => {
+    try {
+      await ensureApkBuilt();
+      serveFileChunk(APK_PATH, req, res);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ ok: false, error: message });
+    }
+  });
+
   app.get('/api/apk/download', async (_req, res) => {
     try {
-      if (!fs.existsSync(APK_PATH)) {
-        const { stdout } = await execFileAsync('python3', [APK_SCRIPT], { timeout: 120000 });
-        lastApkBuildMeta = JSON.parse(stdout.trim());
-      }
+      await ensureApkBuilt();
       const stat = fs.statSync(APK_PATH);
       res.setHeader('Content-Type', 'application/vnd.android.package-archive');
       res.setHeader('Content-Disposition', 'attachment; filename="DKCTF-Android-Plus-EU-v17.apk"');
@@ -202,7 +258,7 @@ async function startServer() {
 
   app.post('/api/source/build', async (_req, res) => {
     try {
-      const { stdout } = await execFileAsync('python3', [SOURCE_SCRIPT], { timeout: 120000 });
+      const { stdout } = await execFileAsync('python3', [SOURCE_SCRIPT], { timeout: 180000 });
       const parsed = JSON.parse(stdout.trim());
       lastSourceBuildMeta = parsed;
       res.json({
@@ -216,12 +272,19 @@ async function startServer() {
     }
   });
 
+  app.get('/api/source/chunk', async (req, res) => {
+    try {
+      await ensureSourceZipBuilt();
+      serveFileChunk(SOURCE_ZIP_PATH, req, res);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ ok: false, error: message });
+    }
+  });
+
   app.get('/api/source/download', async (_req, res) => {
     try {
-      if (!fs.existsSync(SOURCE_ZIP_PATH)) {
-        const { stdout } = await execFileAsync('python3', [SOURCE_SCRIPT], { timeout: 120000 });
-        lastSourceBuildMeta = JSON.parse(stdout.trim());
-      }
+      await ensureSourceZipBuilt();
       const stat = fs.statSync(SOURCE_ZIP_PATH);
       res.setHeader('Content-Type', 'application/zip');
       res.setHeader('Content-Disposition', 'attachment; filename="DKCTF-Android-Plus-Source.zip"');

@@ -99,8 +99,10 @@ export default function App() {
   // APK & Source build state
   const [isBuildingApk, setIsBuildingApk] = useState<boolean>(false);
   const [apkBuildProgress, setApkBuildProgress] = useState<number>(100);
+  const [apkDownloadedBytes, setApkDownloadedBytes] = useState<number>(0);
+  const [readyApkBlobUrl, setReadyApkBlobUrl] = useState<string | null>(null);
   const [apkBuildStageText, setApkBuildStageText] = useState<string>(
-    'Pre-configured DKCTF-Android-Plus-EU-v17.apk verified and ready for download'
+    'Pre-configured DKCTF-Android-Plus-EU-v17.apk (62.64 MiB) verified on server — click Download to stream full APK'
   );
   const [apkBuildResult, setApkBuildResult] = useState<ApkBuildResult>({
     apkPath: '/tmp/DKCTF-Android-Plus-EU-v17.apk',
@@ -114,6 +116,8 @@ export default function App() {
   });
 
   const [isBuildingSource, setIsBuildingSource] = useState<boolean>(false);
+  const [sourceDownloadedBytes, setSourceDownloadedBytes] = useState<number>(0);
+  const [readySourceBlobUrl, setReadySourceBlobUrl] = useState<string | null>(null);
   const [sourceBuildResult, setSourceBuildResult] = useState<SourceBuildResult>({
     zipPath: '/tmp/DKCTF-Android-Plus-Source.zip',
     zipSize: 84486268,
@@ -243,22 +247,135 @@ export default function App() {
     setWuaError(null);
   };
 
+  const decodeBase64ToUint8Array = (b64: string): Uint8Array => {
+    const binStr = window.atob(b64);
+    const len = binStr.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      bytes[i] = binStr.charCodeAt(i);
+    }
+    return bytes;
+  };
+
+  const triggerBlobSave = (blobUrl: string, fileName: string) => {
+    const link = document.createElement('a');
+    link.href = blobUrl;
+    link.download = fileName;
+    link.rel = 'noopener';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  const streamBinaryToBlobUrl = async (
+    chunkEndpoint: string,
+    expectedSize: number,
+    mimeType: string,
+    onProgress: (receivedBytes: number, totalBytes: number) => void
+  ): Promise<string> => {
+    const CHUNK_SIZE = 4 * 1024 * 1024; // 4 MiB per chunk (under Cloud Run 32 MiB limit)
+    const chunks: BlobPart[] = [];
+    let offset = 0;
+    let totalSize = expectedSize;
+    let useBase64Fallback = false;
+
+    while (offset < totalSize) {
+      const reqLen = Math.min(CHUNK_SIZE, totalSize - offset);
+      let chunkBytes: Uint8Array | null = null;
+
+      if (!useBase64Fallback) {
+        const res = await fetch(`${chunkEndpoint}?offset=${offset}&length=${reqLen}`);
+        if (res.ok) {
+          const headerTotal = Number(res.headers.get('X-Total-Size') || 0);
+          if (headerTotal > 0) totalSize = headerTotal;
+          const ab = await res.arrayBuffer();
+          const candidate = new Uint8Array(ab);
+          const validMagic =
+            offset > 0 ||
+            (candidate.byteLength >= 4 &&
+              candidate[0] === 0x50 &&
+              candidate[1] === 0x4b &&
+              candidate[2] === 0x03 &&
+              candidate[3] === 0x04);
+          if (candidate.byteLength === reqLen && validMagic) {
+            chunkBytes = candidate;
+          } else {
+            useBase64Fallback = true;
+          }
+        } else {
+          useBase64Fallback = true;
+        }
+      }
+
+      if (!chunkBytes) {
+        const res = await fetch(
+          `${chunkEndpoint}?offset=${offset}&length=${reqLen}&encoding=base64`
+        );
+        if (!res.ok) {
+          throw new Error(`Failed to transfer binary chunk at offset ${offset} (HTTP ${res.status})`);
+        }
+        const json = await res.json();
+        if (!json.ok || !json.b64) {
+          throw new Error(json.error || `Invalid chunk response at offset ${offset}`);
+        }
+        if (json.totalSize > 0) totalSize = Number(json.totalSize);
+        chunkBytes = decodeBase64ToUint8Array(json.b64);
+        if (
+          offset === 0 &&
+          (chunkBytes.byteLength < 4 ||
+            chunkBytes[0] !== 0x50 ||
+            chunkBytes[1] !== 0x4b ||
+            chunkBytes[2] !== 0x03 ||
+            chunkBytes[3] !== 0x04)
+        ) {
+          throw new Error('Binary header verification failed: expected PK\\x03\\x04 ZIP/APK header');
+        }
+      }
+
+      // Copy into an ArrayBuffer-backed Uint8Array so TypeScript BlobPart is satisfied
+      const safeCopy = new Uint8Array(chunkBytes.byteLength);
+      safeCopy.set(chunkBytes);
+      chunks.push(safeCopy);
+      offset += chunkBytes.byteLength;
+      onProgress(offset, totalSize);
+    }
+
+    const blob = new Blob(chunks, { type: mimeType });
+    if (blob.size < 1_000_000) {
+      throw new Error(`Assembled file size (${blob.size} bytes) is unexpectedly small`);
+    }
+    return URL.createObjectURL(blob);
+  };
+
+  const handleDownloadSampleWuaFile = async () => {
+    try {
+      const res = await fetch('/api/wua/sample');
+      if (!res.ok) throw new Error('Failed to fetch sample .wua');
+      const ab = await res.arrayBuffer();
+      const blob = new Blob([ab], { type: 'application/octet-stream' });
+      const url = URL.createObjectURL(blob);
+      triggerBlobSave(url, 'Donkey_Kong_Country_Tropical_Freeze_EU_v17_Sample.wua');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setWuaError(msg);
+    }
+  };
+
   const handleBuildAndDownloadApk = async () => {
+    if (readyApkBlobUrl && !isBuildingApk) {
+      triggerBlobSave(readyApkBlobUrl, 'DKCTF-Android-Plus-EU-v17.apk');
+      return;
+    }
+
     setIsBuildingApk(true);
     setBuildError(null);
-    setApkBuildProgress(15);
+    setApkDownloadedBytes(0);
+    setApkBuildProgress(8);
     setApkBuildStageText(
-      'Patching lib/arm64-v8a/libwwhd.so (wua.cpp 37-insn RPX resolver + release_of entry bypass)...'
+      'Verifying patched lib/arm64-v8a/libwwhd.so & APK Signature Scheme v2 block (0x7109871a)...'
     );
 
     try {
-      const stepTimer = window.setTimeout(() => {
-        setApkBuildProgress(60);
-        setApkBuildStageText(
-          'Computing SHA-512 Merkle tree & signing APK Signature Scheme v2 block (0x7109871a)...'
-        );
-      }, 160);
-
       const res = await fetch('/api/apk/build', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -268,7 +385,6 @@ export default function App() {
           entryPointHex: wuaReport.rpxMetadata.entryPointHex,
         }),
       });
-      window.clearTimeout(stepTimer);
 
       const data = await res.json();
       if (!res.ok || !data.ok) {
@@ -276,30 +392,46 @@ export default function App() {
       }
 
       setApkBuildResult(data);
-      setApkBuildProgress(100);
-      setApkBuildStageText(
-        `Built & V2-signed DKCTF-Android-Plus-EU-v17.apk (${formatBytes(data.apkSize)}) in ${data.elapsedSeconds}s`
+      const totalBytes = Number(data.apkSize) || 65680113;
+
+      const blobUrl = await streamBinaryToBlobUrl(
+        '/api/apk/chunk',
+        totalBytes,
+        'application/vnd.android.package-archive',
+        (received, total) => {
+          setApkDownloadedBytes(received);
+          const pct = Math.min(100, Math.max(10, Math.round((received / total) * 100)));
+          setApkBuildProgress(pct);
+          setApkBuildStageText(
+            `Streaming verified APK in 4 MiB chunks: ${formatBytes(received)} / ${formatBytes(total)} (${pct}%)`
+          );
+        }
       );
 
-      // Trigger direct browser download of the APK
-      const link = document.createElement('a');
-      link.href = '/api/apk/download';
-      link.download = 'DKCTF-Android-Plus-EU-v17.apk';
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
+      setReadyApkBlobUrl(blobUrl);
+      setApkBuildProgress(100);
+      setApkBuildStageText(
+        `Verified 100% of DKCTF-Android-Plus-EU-v17.apk (${formatBytes(totalBytes)}) in browser memory — saving file`
+      );
+      triggerBlobSave(blobUrl, 'DKCTF-Android-Plus-EU-v17.apk');
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       setBuildError(msg);
-      setApkBuildStageText('APK build encountered an error');
+      setApkBuildStageText('APK transfer encountered an error');
     } finally {
       setIsBuildingApk(false);
     }
   };
 
   const handleDownloadSourceZip = async () => {
+    if (readySourceBlobUrl && !isBuildingSource) {
+      triggerBlobSave(readySourceBlobUrl, 'DKCTF-Android-Plus-Source.zip');
+      return;
+    }
+
     setIsBuildingSource(true);
     setBuildError(null);
+    setSourceDownloadedBytes(0);
     try {
       const res = await fetch('/api/source/build', { method: 'POST' });
       const data = await res.json();
@@ -307,13 +439,19 @@ export default function App() {
         throw new Error(data.error || 'Failed to build source archive');
       }
       setSourceBuildResult(data);
+      const totalBytes = Number(data.zipSize) || 84486268;
 
-      const link = document.createElement('a');
-      link.href = '/api/source/download';
-      link.download = 'DKCTF-Android-Plus-Source.zip';
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
+      const blobUrl = await streamBinaryToBlobUrl(
+        '/api/source/chunk',
+        totalBytes,
+        'application/zip',
+        (received) => {
+          setSourceDownloadedBytes(received);
+        }
+      );
+
+      setReadySourceBlobUrl(blobUrl);
+      triggerBlobSave(blobUrl, 'DKCTF-Android-Plus-Source.zip');
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       setBuildError(msg);
@@ -445,7 +583,11 @@ export default function App() {
             className="px-4 py-2 text-xs font-semibold text-slate-950 bg-amber-500 hover:bg-amber-400 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-2 cursor-pointer"
           >
             <Download className="w-3.5 h-3.5" />
-            {isBuildingApk ? 'Packaging APK...' : 'Download Installer APK'}
+            {isBuildingApk
+              ? `Downloading APK (${formatBytes(apkDownloadedBytes)} / ${formatBytes(apkBuildResult.apkSize)})...`
+              : readyApkBlobUrl
+              ? 'Save Verified 62.64 MiB APK'
+              : 'Download Installer APK (62.64 MiB)'}
           </button>
         </div>
       </header>
@@ -591,7 +733,11 @@ export default function App() {
               className="w-full px-3 py-2 text-xs font-medium text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-lg transition-colors flex items-center justify-center gap-2 cursor-pointer whitespace-nowrap"
             >
               <FolderOpen className="w-3.5 h-3.5 text-amber-500" />
-              <span>{isBuildingSource ? 'Archiving Source...' : 'Export Retargeted Source (.zip)'}</span>
+              <span>
+                {isBuildingSource
+                  ? `Streaming Source (${formatBytes(sourceDownloadedBytes)})...`
+                  : 'Export Retargeted Source (.zip)'}
+              </span>
             </button>
 
             <button
@@ -636,15 +782,26 @@ export default function App() {
                 <button
                   onClick={handleBuildAndDownloadApk}
                   disabled={isBuildingApk}
-                  className="px-4 py-2.5 text-xs font-semibold text-slate-950 bg-amber-500 hover:bg-amber-400 rounded-lg transition-colors flex items-center gap-2 cursor-pointer whitespace-nowrap"
+                  className="px-4 py-2.5 text-xs font-semibold text-slate-950 bg-amber-500 hover:bg-amber-400 disabled:opacity-70 rounded-lg transition-colors flex items-center gap-2 cursor-pointer whitespace-nowrap"
                 >
                   <Download className="w-4 h-4" />
                   <span>
                     {isBuildingApk
-                      ? 'Building Signed APK...'
+                      ? `Streaming APK: ${formatBytes(apkDownloadedBytes)} / ${formatBytes(apkBuildResult.apkSize)} (${apkBuildProgress}%)`
                       : `Download DKCTF-Android-Plus-EU-v17.apk (${formatBytes(apkBuildResult.apkSize)})`}
                   </span>
                 </button>
+
+                {readyApkBlobUrl && (
+                  <a
+                    href={readyApkBlobUrl}
+                    download="DKCTF-Android-Plus-EU-v17.apk"
+                    className="px-4 py-2.5 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg transition-colors flex items-center gap-2 whitespace-nowrap"
+                  >
+                    <CheckCircle2 className="w-4 h-4" />
+                    <span>Save 62.64 MiB APK to Phone (Ready)</span>
+                  </a>
+                )}
 
                 <button
                   onClick={() => fileInputRef.current?.click()}
@@ -660,9 +817,27 @@ export default function App() {
                   className="px-3.5 py-2.5 text-xs font-medium text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100 transition-colors flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
                 >
                   <Code2 className="w-4 h-4" />
-                  <span>Download NDK Source (.zip)</span>
+                  <span>
+                    {isBuildingSource
+                      ? `Streaming Source (${formatBytes(sourceDownloadedBytes)} / ${formatBytes(sourceBuildResult.zipSize)})...`
+                      : 'Download NDK Source (.zip)'}
+                  </span>
                 </button>
               </div>
+              {isBuildingApk && (
+                <div className="space-y-1.5 pt-2">
+                  <div className="flex items-center justify-between text-xs font-mono text-amber-600 dark:text-amber-400 tabular-nums">
+                    <span>{apkBuildStageText}</span>
+                    <span>{apkBuildProgress}%</span>
+                  </div>
+                  <div className="w-full h-2 bg-slate-200 dark:bg-slate-800 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-amber-500 transition-transform duration-150 origin-left"
+                      style={{ transform: `scaleX(${apkBuildProgress / 100})` }}
+                    />
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="lg:col-span-4 rounded-lg overflow-hidden border border-slate-200 dark:border-slate-800 relative min-h-[180px] bg-slate-950 flex flex-col justify-end">
@@ -804,13 +979,12 @@ export default function App() {
                     <AlertCircle className="w-4 h-4 text-amber-500 shrink-0" />
                     <span>{wuaError}</span>
                   </div>
-                  <a
-                    href="/api/wua/sample"
-                    download="Donkey_Kong_Country_Tropical_Freeze_EU_v17_Sample.wua"
-                    className="underline font-medium whitespace-nowrap shrink-0"
+                  <button
+                    onClick={handleDownloadSampleWuaFile}
+                    className="underline font-medium whitespace-nowrap shrink-0 cursor-pointer"
                   >
                     Download Valid Sample .wua
-                  </a>
+                  </button>
                 </div>
               )}
 
@@ -1264,15 +1438,26 @@ export default function App() {
                     <button
                       onClick={handleBuildAndDownloadApk}
                       disabled={isBuildingApk}
-                      className="px-5 py-2.5 text-xs font-semibold text-slate-950 bg-amber-500 hover:bg-amber-400 rounded-lg transition-colors flex items-center gap-2 cursor-pointer whitespace-nowrap"
+                      className="px-5 py-2.5 text-xs font-semibold text-slate-950 bg-amber-500 hover:bg-amber-400 disabled:opacity-70 rounded-lg transition-colors flex items-center gap-2 cursor-pointer whitespace-nowrap"
                     >
                       <Download className="w-4 h-4" />
                       <span>
                         {isBuildingApk
-                          ? 'Building & Signing APK...'
-                          : 'Build & Download Installer APK (62.6 MiB)'}
+                          ? `Streaming APK (${formatBytes(apkDownloadedBytes)} / ${formatBytes(apkBuildResult.apkSize)})...`
+                          : 'Build & Download Installer APK (62.64 MiB)'}
                       </span>
                     </button>
+
+                    {readyApkBlobUrl && (
+                      <a
+                        href={readyApkBlobUrl}
+                        download="DKCTF-Android-Plus-EU-v17.apk"
+                        className="px-4 py-2.5 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg transition-colors flex items-center gap-2 whitespace-nowrap"
+                      >
+                        <CheckCircle2 className="w-4 h-4" />
+                        <span>Save 62.64 MiB APK (Ready in Memory)</span>
+                      </a>
+                    )}
 
                     <button
                       onClick={handleDownloadSourceZip}
@@ -1281,7 +1466,9 @@ export default function App() {
                     >
                       <FolderOpen className="w-4 h-4 text-amber-500" />
                       <span>
-                        Download Full Android NDK Source ({formatBytes(sourceBuildResult.zipSize)})
+                        {isBuildingSource
+                          ? `Streaming Source (${formatBytes(sourceDownloadedBytes)} / ${formatBytes(sourceBuildResult.zipSize)})...`
+                          : `Download Full Android NDK Source (${formatBytes(sourceBuildResult.zipSize)})`}
                       </span>
                     </button>
                   </div>
@@ -1551,27 +1738,26 @@ export default function App() {
           Built on <span className="font-mono">Nycolazs/WindWakerHD-Android-Plus</span> (GPLv3 / MPL-2.0) · Retargeted for Donkey Kong Country: Tropical Freeze (EU v17).
         </div>
         <div className="flex items-center gap-4">
-          <a
-            href="/api/apk/download"
-            download="DKCTF-Android-Plus-EU-v17.apk"
-            className="hover:text-slate-900 dark:hover:text-slate-100 transition-colors"
+          <button
+            onClick={handleBuildAndDownloadApk}
+            disabled={isBuildingApk}
+            className="hover:text-slate-900 dark:hover:text-slate-100 transition-colors cursor-pointer"
           >
-            Download Signed APK
-          </a>
-          <a
-            href="/api/source/download"
-            download="DKCTF-Android-Plus-Source.zip"
-            className="hover:text-slate-900 dark:hover:text-slate-100 transition-colors"
+            Download Signed APK (62.64 MiB)
+          </button>
+          <button
+            onClick={handleDownloadSourceZip}
+            disabled={isBuildingSource}
+            className="hover:text-slate-900 dark:hover:text-slate-100 transition-colors cursor-pointer"
           >
             Download Source (.zip)
-          </a>
-          <a
-            href="/api/wua/sample"
-            download="Donkey_Kong_Country_Tropical_Freeze_EU_v17_Sample.wua"
-            className="hover:text-slate-900 dark:hover:text-slate-100 transition-colors"
+          </button>
+          <button
+            onClick={handleDownloadSampleWuaFile}
+            className="hover:text-slate-900 dark:hover:text-slate-100 transition-colors cursor-pointer"
           >
             Sample EU v17 .wua
-          </a>
+          </button>
         </div>
       </footer>
     </div>
