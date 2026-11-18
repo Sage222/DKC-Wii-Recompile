@@ -1,0 +1,6 @@
+{
+  "name": "DKCTF Android Plus — WUA Recompiler & APK Studio",
+  "description": "Surgical retargeting studio and Android installer APK builder adapting Nycolazs/WindWakerHD-Android-Plus for Donkey Kong Country: Tropical Freeze (EU v17 .wua).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
